@@ -1,3 +1,10 @@
+
+
+![1000056144](https://github.com/user-attachments/assets/406fa744-af15-4572-a37d-88a1d09bf87b)
+
+
+
+
 👻 GhostSync
 
 GhostSync is an open-source Android background utility designed to bridge the gap between your favorite music player and social apps that exclusively support Spotify.
