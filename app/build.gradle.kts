@@ -4,19 +4,14 @@ plugins {
 
 android {
     namespace = "com.example.spotifysync"
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    compileSdk = 35  // FIX: sintassi corretta (API 36 non ancora stabile, usa 35)
 
     defaultConfig {
         applicationId = "com.example.spotifysync"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -33,6 +28,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
 }
 
 dependencies {

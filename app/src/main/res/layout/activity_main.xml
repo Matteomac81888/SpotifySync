@@ -1,111 +1,95 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#121212"
-    android:fillViewport="true">
+    android:orientation="vertical"
+    android:padding="20dp">
 
-    <LinearLayout
+    <!-- Intestazione -->
+
+    <!-- Avvio Automatico -->
+
+    <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="20dp">
+        android:layout_marginBottom="16dp"
+        android:gravity="center"
+        android:text="GhostSync"
+        android:textColor="#1DB954"
+        android:textSize="28sp"
+        android:textStyle="bold" />
 
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="GhostSync"
-            android:textColor="#1DB954"
-            android:textSize="32sp"
-            android:textStyle="bold"
-            android:gravity="center"
-            android:layout_marginBottom="8dp" />
+    <Switch
+        android:id="@+id/switchAutoStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="14dp"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:text="Avvio Automatico in background (experimental), suggest to keep it on"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:thumbTint="#1DB954"
+        android:trackTint="#4D1DB954" />
 
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Sincronizza in background con Spotify"
-            android:textColor="#B3B3B3"
-            android:textSize="14sp"
-            android:gravity="center"
-            android:layout_marginBottom="24dp" />
+    <!-- Pulsante Permessi -->
+    <Button
+        android:id="@+id/btnPermission"
+        android:layout_width="match_parent"
+        android:layout_height="45dp"
+        android:layout_marginBottom="14dp"
+        android:text="Apri Permessi Notifiche"
+        android:textColor="#FFFFFF"
+        android:textStyle="bold"
+        app:backgroundTint="#333333" />
 
-        <!-- Card Permessi -->
-        <androidx.cardview.widget.CardView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="20dp"
-            app:cardBackgroundColor="#282828"
-            app:cardCornerRadius="12dp"
-            app:cardElevation="4dp">
+    <!-- Etichetta lista app -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="6dp"
+        android:paddingStart="4dp"
+        android:text="Da quali app copiare la musica?"
+        android:textColor="#B3B3B3"
+        android:textSize="14sp" />
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:padding="16dp">
+    <!-- Lista App -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvApps"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginBottom="14dp"
+        android:background="#282828"
+        android:padding="10dp" />
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="1. Permessi Necessari"
-                    android:textColor="#FFFFFF"
-                    android:textSize="18sp"
-                    android:textStyle="bold"
-                    android:layout_marginBottom="12dp"/>
+    <!-- Etichetta mini player -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="6dp"
+        android:paddingStart="4dp"
+        android:text="Mini Player (Login / Debug), fai il login e accetta i cookies, attendi poi fino al caricamento della pagina"
+        android:textColor="#B3B3B3"
+        android:textSize="14sp" />
 
-                <Button
-                    android:id="@+id/btnPermission"
-                    android:layout_width="match_parent"
-                    android:layout_height="50dp"
-                    android:text="Abilita Lettura Notifiche"
-                    android:textColor="#FFFFFF"
-                    android:textSize="16sp"
-                    android:textStyle="bold"
-                    app:backgroundTint="#1DB954"
-                    app:cornerRadius="25dp" />
-            </LinearLayout>
-        </androidx.cardview.widget.CardView>
+    <!-- Mini Player -->
+    <androidx.cardview.widget.CardView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1.5"
+        app:cardBackgroundColor="#282828"
+        app:cardCornerRadius="12dp">
 
-        <!-- Card Spotify Web Player -->
-        <androidx.cardview.widget.CardView
+        <WebView
+            android:id="@+id/loginWebView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            app:cardBackgroundColor="#282828"
-            app:cardCornerRadius="12dp"
-            app:cardElevation="4dp"
-            android:layout_weight="1">
+            android:background="#121212" />
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:orientation="vertical"
-                android:padding="16dp">
+    </androidx.cardview.widget.CardView>
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="2. Accesso a Spotify"
-                    android:textColor="#FFFFFF"
-                    android:textSize="18sp"
-                    android:textStyle="bold"
-                    android:layout_marginBottom="8dp"/>
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Fai il login qui sotto. Una volta fatto, puoi chiudere l'app."
-                    android:textColor="#B3B3B3"
-                    android:textSize="14sp"
-                    android:layout_marginBottom="12dp"/>
-
-                <WebView
-                    android:id="@+id/loginWebView"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
-                    android:background="#121212" />
-            </LinearLayout>
-        </androidx.cardview.widget.CardView>
-    </LinearLayout>
-</ScrollView>
+</LinearLayout>
