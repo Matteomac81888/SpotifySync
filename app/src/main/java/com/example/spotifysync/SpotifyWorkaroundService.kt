@@ -38,13 +38,29 @@ class SpotifyWorkaroundService : Service() {
     private val channelId = "spotify_sync_channel"
     private val notificationId = 1
 
+    // Stato brano corrente
     private var targetTitle = ""
     private var targetArtist = ""
+
+    // Stato WebView / Spotify
     private var isSpotifyReady = false
-    private var isSyncing = false
-    private var lastSyncTime = 0L
+    private var isWebViewAlive = false
 
+    // Lock navigazione: evitiamo di caricare più URL contemporaneamente
+    private var isNavigating = false
+    private var navigationStartTime = 0L
+    private val navigationTimeoutMs = 12_000L   // reset lock se la pagina non risponde
 
+    // Contatore click per il brano corrente
+    private var clickAttempts = 0
+    private val maxClickAttempts = 6
+
+    // Ultimo momento in cui sappiamo per certo che Spotify sta suonando il brano giusto
+    private var lastConfirmedPlayingTime = 0L
+
+    // ──────────────────────────────────────────────
+    // Silenziatore audio
+    // ──────────────────────────────────────────────
     private val jsSilencer = """
         (function() {
             if (window.__gs) return;
@@ -73,56 +89,162 @@ class SpotifyWorkaroundService : Service() {
         })();
     """.trimIndent()
 
+    // ──────────────────────────────────────────────
+    // Click sul primo risultato + verifica playback
+    // ──────────────────────────────────────────────
     private val jsClickFirstTrack = """
         (function() {
             var attempts = 0;
+            var maxAttempts = 60;
             var t = setInterval(function() {
                 attempts++;
+                if (attempts > maxAttempts) {
+                    clearInterval(t);
+                    AndroidBridge.onPlayResult('timeout');
+                    return;
+                }
                 var rows = document.querySelectorAll('[data-testid="tracklist-row"]');
-                if (rows.length === 0 && attempts < 30) return;
+                if (rows.length === 0) return;
                 clearInterval(t);
-                if (rows.length === 0) { AndroidBridge.onPlayResult('no_rows'); return; }
+
                 var row = rows[0];
                 ['mouseenter','mouseover'].forEach(function(ev){
                     row.dispatchEvent(new MouseEvent(ev,{bubbles:true,cancelable:true}));
                 });
+
                 var btn = row.querySelector('[data-testid="play-button"]')
                        || row.querySelector('[data-testid*="play"]')
                        || row.querySelector('button[aria-label*="Play"]')
                        || row.querySelector('button[aria-label*="Riproduci"]')
                        || row.querySelector('button[aria-label*="play"]');
-                if (btn) { btn.click(); AndroidBridge.onPlayResult('btn_click'); return; }
-                row.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,view:window}));
-                AndroidBridge.onPlayResult('dblclick');
-            }, 500);
+
+                if (btn) {
+                    btn.click();
+                } else {
+                    row.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,view:window}));
+                }
+
+                // Verifica dopo 1.2s se sta suonando (era 2s)
+                setTimeout(function() {
+                    var pb = document.querySelector('[data-testid="control-button-playpause"]');
+                    if (!pb) { AndroidBridge.onPlayResult('no_playbar'); return; }
+                    var lbl = (pb.getAttribute('aria-label') || '').toLowerCase();
+                    var playing = lbl.includes('pause') || lbl.includes('pausa');
+                    if (playing) {
+                        AndroidBridge.onPlayResult('verified_playing');
+                    } else {
+                        pb.click();
+                        setTimeout(function() {
+                            var lbl2 = (pb.getAttribute('aria-label') || '').toLowerCase();
+                            var ok = lbl2.includes('pause') || lbl2.includes('pausa');
+                            AndroidBridge.onPlayResult(ok ? 'fallback_ok' : 'fallback_fail');
+                        }, 800);
+                    }
+                }, 1200);
+            }, 200);
         })();
     """.trimIndent()
 
+    // Controlla solo se sta suonando (senza toccare nulla)
     private val jsCheckPlaying = """
         (function() {
             var btn = document.querySelector('[data-testid="control-button-playpause"]');
             if (!btn) { AndroidBridge.onPlayResult('no_btn'); return; }
             var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
-            var playing = lbl.includes('pause') || lbl.includes('metti in pausa');
+            var playing = lbl.includes('pause') || lbl.includes('pausa');
             AndroidBridge.onPlayResult(playing ? 'playing' : 'paused');
         })();
     """.trimIndent()
 
+    // ──────────────────────────────────────────────
+    // Bridge JS → Kotlin
+    // ──────────────────────────────────────────────
     inner class JsBridge {
         @JavascriptInterface
         fun onPlayResult(result: String) {
             mainHandler.post {
-                isSyncing = false
-                if ((result == "no_rows" || result == "no_btn" || result == "paused") && targetTitle.isNotEmpty()) {
-                    val elapsed = System.currentTimeMillis() - lastSyncTime
-                    if (elapsed > 15000) {
-                        mainHandler.postDelayed({ triggerSearch(targetTitle, targetArtist) }, 20000)
+                when (result) {
+                    "verified_playing", "fallback_ok", "playing" -> {
+                        // Sta suonando: aggiorna timestamp e azzera tentativi
+                        lastConfirmedPlayingTime = System.currentTimeMillis()
+                        clickAttempts = 0
+                        isNavigating = false
+                    }
+                    else -> {
+                        // Non sta suonando: rilascia il lock di navigazione
+                        // Il polling aggressor ci riproverà a breve
+                        isNavigating = false
                     }
                 }
             }
         }
     }
 
+    // ──────────────────────────────────────────────
+    // POLLING AGGRESSIVO — ogni 3 secondi
+    // Cuore del fix: se c'è un brano target e Spotify
+    // non sta confermando il playback, ri-naviga subito.
+    // ──────────────────────────────────────────────
+    private val aggressivePoller = object : Runnable {
+        override fun run() {
+            tickPoll()
+            mainHandler.postDelayed(this, 3_000)
+        }
+    }
+
+    private fun tickPoll() {
+        if (targetTitle.isEmpty()) return
+
+        // Reset del lock navigazione se scaduto
+        if (isNavigating && System.currentTimeMillis() - navigationStartTime > navigationTimeoutMs) {
+            isNavigating = false
+        }
+
+        if (isNavigating) return
+
+        // WebView non pronta → ricrea
+        if (!isWebViewAlive) {
+            initWebView()
+            return
+        }
+
+        // Spotify non pronta → ricarica home
+        if (!isSpotifyReady) {
+            navigate("https://open.spotify.com/")
+            return
+        }
+
+        // Spotify pronta: controlla se sta suonando il brano giusto.
+        // Se non abbiamo conferma entro 3s dall'ultimo check, ri-cerca subito.
+        val timeSinceConfirmed = System.currentTimeMillis() - lastConfirmedPlayingTime
+        if (timeSinceConfirmed > 3_000) {
+            if (clickAttempts < maxClickAttempts) {
+                clickAttempts++
+                triggerSearch(targetTitle, targetArtist)
+            } else {
+                webView?.evaluateJavascript(jsCheckPlaying, null)
+            }
+        } else {
+            webView?.evaluateJavascript(jsCheckPlaying, null)
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Keep-alive timer JS Android
+    // ──────────────────────────────────────────────
+    private val keepAliveRunnable = object : Runnable {
+        override fun run() {
+            webView?.let {
+                it.resumeTimers()
+                it.onResume()
+            }
+            mainHandler.postDelayed(this, 4_000)
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Watchdog — rebind listener ogni 20s
+    // ──────────────────────────────────────────────
     private val watchdog = object : Runnable {
         override fun run() {
             try {
@@ -130,13 +252,13 @@ class SpotifyWorkaroundService : Service() {
                     ComponentName(applicationContext, MediaListenerService::class.java)
                 )
             } catch (_: Exception) {}
-            if (targetTitle.isNotEmpty() && isSpotifyReady && !isSyncing) {
-                webView?.evaluateJavascript(jsCheckPlaying, null)
-            }
-            mainHandler.postDelayed(this, 30000)
+            mainHandler.postDelayed(this, 20_000)
         }
     }
 
+    // ──────────────────────────────────────────────
+    // Lifecycle
+    // ──────────────────────────────────────────────
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
@@ -145,7 +267,9 @@ class SpotifyWorkaroundService : Service() {
         }
         startForeground(notificationId, buildNotification("In attesa di musica..."))
         initWebView()
-        mainHandler.postDelayed(watchdog, 30000)
+        mainHandler.post(keepAliveRunnable)
+        mainHandler.postDelayed(watchdog, 20_000)
+        mainHandler.postDelayed(aggressivePoller, 3_000)  // avvia il polling dopo 3s
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -159,6 +283,9 @@ class SpotifyWorkaroundService : Service() {
                 try { windowManager.removeView(it) } catch (_: Exception) {}
                 it.destroy()
             }
+            isWebViewAlive = false
+            isSpotifyReady = false
+            isNavigating = false
 
             webView = WebView(applicationContext)
             webView!!.addJavascriptInterface(JsBridge(), "AndroidBridge")
@@ -168,17 +295,18 @@ class SpotifyWorkaroundService : Service() {
             else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
             val params = WindowManager.LayoutParams(
-                1, 1, overlayType,
+                2, 2, overlayType,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                         WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                alpha = 0.01f
+                alpha = 0.02f
             }
             windowManager.addView(webView, params)
             webView!!.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            isWebViewAlive = true
 
             webView!!.settings.apply {
                 javaScriptEnabled = true
@@ -203,14 +331,22 @@ class SpotifyWorkaroundService : Service() {
 
             webView!!.webViewClient = object : WebViewClient() {
 
-                override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                override fun onRenderProcessGone(
+                    view: WebView?,
+                    detail: RenderProcessGoneDetail?
+                ): Boolean {
                     isSpotifyReady = false
-                    isSyncing = false
-                    mainHandler.postDelayed({ initWebView() }, 2000)
+                    isNavigating = false
+                    isWebViewAlive = false
+                    mainHandler.postDelayed({ initWebView() }, 2_000)
                     return true
                 }
 
-                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                override fun onPageStarted(
+                    view: WebView?,
+                    url: String?,
+                    favicon: android.graphics.Bitmap?
+                ) {
                     super.onPageStarted(view, url, favicon)
                     view?.evaluateJavascript(jsSilencer, null)
                 }
@@ -218,30 +354,43 @@ class SpotifyWorkaroundService : Service() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (url == null) return
                     view?.evaluateJavascript(jsSilencer, null)
+                    isNavigating = false   // pagina caricata, rilascia lock
 
                     when {
                         isSpotifyHome(url) -> {
                             isSpotifyReady = true
-                            isSyncing = false
+                            // Home caricata: se c'è un brano target, cerca subito (no delay)
                             if (targetTitle.isNotEmpty()) {
-                                mainHandler.postDelayed({ triggerSearch(targetTitle, targetArtist) }, 1500)
+                                triggerSearch(targetTitle, targetArtist)
                             }
                         }
                         url.contains("/search/") -> {
-                            // Pagina ricerca caricata: clicca il primo risultato
-                            view?.evaluateJavascript(jsClickFirstTrack, null)
+                            // Pagina ricerca caricata: click sul primo risultato quasi subito
+                            mainHandler.postDelayed({
+                                view?.evaluateJavascript(jsClickFirstTrack, null)
+                            }, 100)
                         }
                         url.contains("/login") || url.contains("/signup") -> {
                             isSpotifyReady = false
-                            isSyncing = false
+                            isNavigating = false
                         }
                     }
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String?
+                ) {
+                    super.onReceivedError(view, errorCode, description, failingUrl)
+                    isNavigating = false   // errore caricamento, rilascia lock
                 }
             }
 
             webView!!.resumeTimers()
-            isSpotifyReady = false
-            webView!!.loadUrl("https://open.spotify.com/")
+            webView!!.onResume()
+            navigate("https://open.spotify.com/")
         }
     }
 
@@ -251,51 +400,82 @@ class SpotifyWorkaroundService : Service() {
                 !url.contains("/album") && !url.contains("/artist") &&
                 !url.contains("/login") && !url.contains("/signup")
 
+    // ──────────────────────────────────────────────
+    // Navigazione con lock
+    // ──────────────────────────────────────────────
+    private fun navigate(url: String) {
+        isNavigating = true
+        navigationStartTime = System.currentTimeMillis()
+        mainHandler.post {
+            try {
+                webView?.loadUrl(url)
+            } catch (_: Exception) {
+                isNavigating = false
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Comandi
+    // ──────────────────────────────────────────────
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_STICKY
         when (intent.action) {
             "STOP_SERVICE" -> {
+                stopSelf()
                 return START_NOT_STICKY
             }
             "SYNC_TRACK" -> {
                 val title = intent.getStringExtra("TITLE") ?: return START_STICKY
                 val artist = intent.getStringExtra("ARTIST") ?: return START_STICKY
+
+                val newTrack = "$title|$artist"
+                val trackChanged = newTrack != "$targetTitle|$targetArtist"
+
                 targetTitle = title
                 targetArtist = artist
-                notificationManager.notify(notificationId, buildNotification("🎵 $title — $artist"))
-                forceSync(title, artist)
+
+                if (trackChanged) {
+                    // Brano cambiato: azzera tutto e cerca subito
+                    clickAttempts = 0
+                    lastConfirmedPlayingTime = 0L
+                    isNavigating = false
+                    notificationManager.notify(notificationId, buildNotification("🎵 $title — $artist"))
+                    forceSync(title, artist)
+                }
+                // Se stesso brano: il polling aggressivo si occupa di risincronizzare
             }
         }
         return START_STICKY
     }
 
     private fun forceSync(title: String, artist: String) {
-        if (isSyncing) return
-        if (System.currentTimeMillis() - lastSyncTime < 4000) return
-        if (!isSpotifyReady) {
-            mainHandler.post { webView?.loadUrl("https://open.spotify.com/") }
+        if (!isWebViewAlive) {
+            initWebView()
             return
         }
+        if (!isSpotifyReady) {
+            // Solo se non è pronta carichiamo la home, altrimenti andiamo dritti alla ricerca
+            navigate("https://open.spotify.com/")
+            return
+        }
+        // Spotify già pronta: vai diretto alla ricerca, senza passare dalla home
         triggerSearch(title, artist)
     }
 
-    // La navigazione parte SEMPRE da Kotlin con loadUrl, mai da JS con window.location
     private fun triggerSearch(title: String, artist: String) {
-        if (isSyncing) return
-        isSyncing = true
-        lastSyncTime = System.currentTimeMillis()
-        mainHandler.post {
-            try {
-                val query = URLEncoder.encode("$title $artist", "UTF-8")
-                webView?.loadUrl("https://open.spotify.com/search/$query/tracks")
-            } catch (_: Exception) { isSyncing = false }
-        }
+        if (isNavigating) return
+        navigate("https://open.spotify.com/search/${URLEncoder.encode("$title $artist", "UTF-8")}/tracks")
     }
 
-
+    // ──────────────────────────────────────────────
+    // Cleanup
+    // ──────────────────────────────────────────────
     override fun onDestroy() {
         super.onDestroy()
         mainHandler.removeCallbacks(watchdog)
+        mainHandler.removeCallbacks(keepAliveRunnable)
+        mainHandler.removeCallbacks(aggressivePoller)
         webView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
             it.destroy()
@@ -304,9 +484,11 @@ class SpotifyWorkaroundService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val stopPi = PendingIntent.getService(this, 0,
+        val stopPi = PendingIntent.getService(
+            this, 0,
             Intent(this, SpotifyWorkaroundService::class.java).apply { action = "STOP_SERVICE" },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("Ghost Sync").setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)

@@ -16,18 +16,14 @@ class MediaListenerService : NotificationListenerService() {
 
     private var lastPlayedTrack = ""
     private val handler = Handler(Looper.getMainLooper())
-    // FIX: Debounce per evitare sync multipli su cambio canzone rapido
     private var debounceRunnable: Runnable? = null
+    // Debounce minimo: notifica il servizio quasi subito
+    private val debounceDelayMs = 200L
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         try {
-            val activeNotifs = activeNotifications
-            if (activeNotifs != null) {
-                for (sbn in activeNotifs) {
-                    processNotification(sbn)
-                }
-            }
+            activeNotifications?.forEach { processNotification(it) }
         } catch (_: Exception) {}
     }
 
@@ -35,16 +31,8 @@ class MediaListenerService : NotificationListenerService() {
         processNotification(sbn)
     }
 
-    // FIX: Resetta il lastPlayedTrack quando la notifica viene rimossa (app pausata/fermata)
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
-        val packageName = sbn.packageName
-        val prefs = getSharedPreferences("GhostSyncPrefs", Context.MODE_PRIVATE)
-        val allowedApps = prefs.getStringSet("ALLOWED_APPS", setOf()) ?: setOf()
-
-        if (allowedApps.contains(packageName)) {
-            // L'utente ha fermato la musica nell'altra app - non serve più sincronizzare
-            // Opzionale: potresti fermare il WebView qui
-        }
+        // Nessuna azione: la WebView continua fino al prossimo sync
     }
 
     private fun processNotification(sbn: StatusBarNotification) {
@@ -53,8 +41,7 @@ class MediaListenerService : NotificationListenerService() {
         if (packageName == this.packageName || packageName.contains("spotify")) return
 
         val prefs = getSharedPreferences("GhostSyncPrefs", Context.MODE_PRIVATE)
-        val isAutoStartEnabled = prefs.getBoolean("PREF_AUTOSTART", true)
-        if (!isAutoStartEnabled) return
+        if (!prefs.getBoolean("PREF_AUTOSTART", true)) return
 
         val allowedApps = prefs.getStringSet("ALLOWED_APPS", setOf()) ?: setOf()
         if (!allowedApps.contains(packageName)) return
@@ -67,12 +54,16 @@ class MediaListenerService : NotificationListenerService() {
         var isPlaying = false
 
         try {
-            val mediaSessionToken = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                extras.getParcelable(Notification.EXTRA_MEDIA_SESSION, MediaSession.Token::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                extras.getParcelable(Notification.EXTRA_MEDIA_SESSION)
-            }
+            val mediaSessionToken: MediaSession.Token? =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    extras.getParcelable(
+                        Notification.EXTRA_MEDIA_SESSION,
+                        MediaSession.Token::class.java
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    extras.getParcelable(Notification.EXTRA_MEDIA_SESSION)
+                }
 
             if (mediaSessionToken != null) {
                 val controller = MediaController(this, mediaSessionToken)
@@ -84,54 +75,55 @@ class MediaListenerService : NotificationListenerService() {
                     artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
                 }
 
-                // FIX: Controlla che la musica stia davvero suonando (non in pausa)
-                if (playbackState != null) {
-                    isPlaying = playbackState.state == android.media.session.PlaybackState.STATE_PLAYING
+                isPlaying = if (playbackState != null) {
+                    playbackState.state == android.media.session.PlaybackState.STATE_PLAYING
                 } else {
-                    // Fallback: se non riusciamo a leggere lo stato, assumiamo che stia suonando
-                    isPlaying = true
+                    true // Fallback conservativo
                 }
             }
         } catch (_: Exception) {
             isPlaying = true // Fallback
         }
 
-        // Leggi titolo/artista dalla notifica come fallback
+        // Fallback da notifica se MediaSession non ha metadati
         if (title.isNullOrEmpty() || artist.isNullOrEmpty()) {
             title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
             artist = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
         }
 
-        // FIX: Non sincronizzare se in pausa
         if (!isPlaying) return
+        if (title.isNullOrEmpty() || artist.isNullOrEmpty()) return
 
-        if (!title.isNullOrEmpty() && !artist.isNullOrEmpty()) {
-            val cleanTitle = title.replace(
-                Regex("(?i)\\s*\\(official.*?\\)|\\s*\\[official.*?]|\\s*\\(lyric.*?\\)|\\s*\\(video.*?\\)|\\s*\\(audio.*?\\)|\\s*\\[lyrics.*?]|\\s*\\(feat.*?\\)|\\s*ft\\..*"),
-                ""
-            ).trim()
+        val cleanTitle = title.replace(
+            Regex(
+                "(?i)\\s*\\(official.*?\\)|\\s*\\[official.*?]|\\s*\\(lyric.*?\\)|" +
+                        "\\s*\\(video.*?\\)|\\s*\\(audio.*?\\)|\\s*\\[lyrics.*?]|" +
+                        "\\s*\\(feat.*?\\)|\\s*ft\\..*"
+            ), ""
+        ).trim()
 
-            val currentTrack = "$cleanTitle|$artist"
+        val currentTrack = "$cleanTitle|$artist"
+        if (currentTrack == lastPlayedTrack) return
+        lastPlayedTrack = currentTrack
 
-            if (currentTrack == lastPlayedTrack) return
-            lastPlayedTrack = currentTrack
+        debounceRunnable?.let { handler.removeCallbacks(it) }
+        val capturedTitle = cleanTitle
+        val capturedArtist = artist
 
-            // FIX: Debounce 1.5s - se la canzone cambia velocemente (es. skip rapidi) aspetta
-            debounceRunnable?.let { handler.removeCallbacks(it) }
-            val capturedTitle = cleanTitle
-            val capturedArtist = artist
-
-            debounceRunnable = Runnable {
-                val intent = Intent(this, SpotifyWorkaroundService::class.java).apply {
-                    action = "SYNC_TRACK"
-                    putExtra("TITLE", capturedTitle)
-                    putExtra("ARTIST", capturedArtist)
-                }
-                try {
-                    startForegroundService(intent)
-                } catch (_: Exception) {}
+        debounceRunnable = Runnable {
+            val intent = Intent(this, SpotifyWorkaroundService::class.java).apply {
+                action = "SYNC_TRACK"
+                putExtra("TITLE", capturedTitle)
+                putExtra("ARTIST", capturedArtist)
             }
-            handler.postDelayed(debounceRunnable!!, 1500)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+            } catch (_: Exception) {}
         }
+        handler.postDelayed(debounceRunnable!!, debounceDelayMs)
     }
 }
